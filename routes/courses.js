@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
 // LUCKILY ACADEMY — routes/courses.js
-// Routes formations : liste, détail, PDF
+// Routes formations : liste, détail, PDF (PostgreSQL)
 // ═══════════════════════════════════════════════════════════
 'use strict';
 
@@ -8,38 +8,49 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const fs = require('fs');
-const { getDB } = require('../database');
+const { pool } = require('../database');
 const { authenticateToken, optionalAuth } = require('../middleware/auth');
 
 // ══════════════════════════════════
 // GET /api/courses
 // Liste publique des formations
 // ══════════════════════════════════
-router.get('/', optionalAuth, (req, res) => {
+router.get('/', optionalAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const db = getDB();
-    const courses = db.prepare(`
+    const result = await client.query(`
       SELECT id, title, category, level, duration, price, description, summary, icon, image_url
       FROM courses WHERE is_active = 1
       ORDER BY price DESC, title ASC
-    `).all();
+    `);
+
+    const courses = result.rows;
 
     // Si connecté, ajouter info d'enrollment
-    const result = courses.map(c => {
+    const coursesWithEnrollment = [];
+    for (const c of courses) {
       let enrolled = false;
       if (req.user) {
-        const e = db.prepare(
-          'SELECT id FROM enrollments WHERE user_id = ? AND course_id = ?'
-        ).get(req.user.id, c.id);
-        enrolled = !!e;
+        const enrollResult = await client.query(
+          'SELECT id FROM enrollments WHERE user_id = $1 AND course_id = $2',
+          [req.user.id, c.id]
+        );
+        enrolled = enrollResult.rows.length > 0;
       }
-      return { ...c, summary: JSON.parse(c.summary || '[]'), enrolled };
-    });
+      
+      coursesWithEnrollment.push({
+        ...c,
+        summary: JSON.parse(c.summary || '[]'),
+        enrolled
+      });
+    }
 
-    res.json({ success: true, courses: result });
+    res.json({ success: true, courses: coursesWithEnrollment });
   } catch (err) {
     console.error('Courses list error:', err);
     res.status(500).json({ success: false, message: 'Erreur serveur.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -48,30 +59,35 @@ router.get('/', optionalAuth, (req, res) => {
 // Détail d'une formation
 // (contenu complet si inscrit)
 // ══════════════════════════════════
-router.get('/:id', optionalAuth, (req, res) => {
+router.get('/:id', optionalAuth, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const db = getDB();
-    const course = db.prepare(`
-      SELECT * FROM courses WHERE id = ? AND is_active = 1
-    `).get(req.params.id);
+    const courseResult = await client.query(
+      `SELECT * FROM courses WHERE id = $1 AND is_active = 1`,
+      [req.params.id]
+    );
 
-    if (!course) {
+    if (courseResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Formation introuvable.' });
     }
 
+    const course = courseResult.rows[0];
     let enrolled = false;
     let progress = [];
 
     if (req.user) {
-      const e = db.prepare(
-        'SELECT id FROM enrollments WHERE user_id = ? AND course_id = ?'
-      ).get(req.user.id, course.id);
-      enrolled = !!e;
+      const enrollResult = await client.query(
+        'SELECT id FROM enrollments WHERE user_id = $1 AND course_id = $2',
+        [req.user.id, course.id]
+      );
+      enrolled = enrollResult.rows.length > 0;
 
       if (enrolled) {
-        progress = db.prepare(
-          'SELECT lesson_key FROM lesson_progress WHERE user_id = ? AND course_id = ?'
-        ).all(req.user.id, course.id).map(p => p.lesson_key);
+        const progressResult = await client.query(
+          'SELECT lesson_key FROM lesson_progress WHERE user_id = $1 AND course_id = $2',
+          [req.user.id, course.id]
+        );
+        progress = progressResult.rows.map(p => p.lesson_key);
       }
     }
 
@@ -137,6 +153,8 @@ router.get('/:id', optionalAuth, (req, res) => {
   } catch (err) {
     console.error('Course detail error:', err);
     res.status(500).json({ success: false, message: 'Erreur serveur.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -144,33 +162,42 @@ router.get('/:id', optionalAuth, (req, res) => {
 // GET /api/courses/:id/lesson/:lessonId
 // Contenu d'une leçon spécifique
 // ══════════════════════════════════
-router.get('/:id/lesson/:lessonId', authenticateToken, (req, res) => {
+router.get('/:id/lesson/:lessonId', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const db = getDB();
-
     // Vérifier enrollment
-    const enrolled = db.prepare(
-      'SELECT id FROM enrollments WHERE user_id = ? AND course_id = ?'
-    ).get(req.user.id, req.params.id);
+    const enrollResult = await client.query(
+      'SELECT id FROM enrollments WHERE user_id = $1 AND course_id = $2',
+      [req.user.id, req.params.id]
+    );
 
-    if (!enrolled) {
+    if (enrollResult.rows.length === 0) {
       return res.status(403).json({
         success: false,
         message: 'Vous n\'êtes pas inscrit à cette formation.'
       });
     }
 
-    const course = db.prepare('SELECT content FROM courses WHERE id = ?').get(req.params.id);
-    if (!course) return res.status(404).json({ success: false, message: 'Formation introuvable.' });
+    const courseResult = await client.query(
+      'SELECT content FROM courses WHERE id = $1',
+      [req.params.id]
+    );
+    
+    if (courseResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Formation introuvable.' });
+    }
 
-    const content = JSON.parse(course.content || '{}');
+    const content = JSON.parse(courseResult.rows[0].content || '{}');
     let lessonFound = null;
 
     if (content.chapters) {
       for (const ch of content.chapters) {
         if (ch.lessons) {
           const l = ch.lessons.find(l => l.id === req.params.lessonId);
-          if (l) { lessonFound = { ...l, chapterTitle: ch.title }; break; }
+          if (l) { 
+            lessonFound = { ...l, chapterTitle: ch.title }; 
+            break; 
+          }
         }
       }
     }
@@ -183,6 +210,8 @@ router.get('/:id/lesson/:lessonId', authenticateToken, (req, res) => {
   } catch (err) {
     console.error('Lesson error:', err);
     res.status(500).json({ success: false, message: 'Erreur serveur.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -190,24 +219,32 @@ router.get('/:id/lesson/:lessonId', authenticateToken, (req, res) => {
 // GET /api/courses/:id/pdf
 // Télécharger le PDF (inscrits seulement)
 // ══════════════════════════════════
-router.get('/:id/pdf', authenticateToken, (req, res) => {
+router.get('/:id/pdf', authenticateToken, async (req, res) => {
+  const client = await pool.connect();
   try {
-    const db = getDB();
-
     // Vérifier enrollment
-    const enrolled = db.prepare(
-      'SELECT id FROM enrollments WHERE user_id = ? AND course_id = ?'
-    ).get(req.user.id, req.params.id);
+    const enrollResult = await client.query(
+      'SELECT id FROM enrollments WHERE user_id = $1 AND course_id = $2',
+      [req.user.id, req.params.id]
+    );
 
-    if (!enrolled) {
+    if (enrollResult.rows.length === 0) {
       return res.status(403).json({
         success: false,
         message: 'Vous devez être inscrit pour télécharger le PDF.'
       });
     }
 
-    const course = db.prepare('SELECT title, pdf_url FROM courses WHERE id = ?').get(req.params.id);
-    if (!course) return res.status(404).json({ success: false, message: 'Formation introuvable.' });
+    const courseResult = await client.query(
+      'SELECT title, pdf_url FROM courses WHERE id = $1',
+      [req.params.id]
+    );
+    
+    if (courseResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Formation introuvable.' });
+    }
+
+    const course = courseResult.rows[0];
 
     // Si PDF externe (URL)
     if (course.pdf_url && course.pdf_url.startsWith('http')) {
@@ -233,6 +270,8 @@ router.get('/:id/pdf', authenticateToken, (req, res) => {
   } catch (err) {
     console.error('PDF download error:', err);
     res.status(500).json({ success: false, message: 'Erreur serveur.' });
+  } finally {
+    client.release();
   }
 });
 
