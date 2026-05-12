@@ -1,106 +1,100 @@
 // ═══════════════════════════════════════════════════════════
 // LUCKILY ACADEMY — database.js
-// Initialisation SQLite + seed des formations
+// Initialisation PostgreSQL + seed des formations
 // ═══════════════════════════════════════════════════════════
 'use strict';
 
-const Database = require('better-sqlite3');
-const path = require('path');
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'luckily.db');
-
-let db;
-
-function getDB() {
-  if (!db) {
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
-  }
-  return db;
-}
+// Configuration PostgreSQL
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
 
 // ─────────────────────────────────────────
 // INITIALISATION DES TABLES
 // ─────────────────────────────────────────
-function initDB() {
-  const db = getDB();
+async function initDB() {
+  const client = await pool.connect();
+  try {
+    // Table utilisateurs
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id         TEXT PRIMARY KEY,
+        fullname   TEXT NOT NULL,
+        email      TEXT UNIQUE NOT NULL,
+        password   TEXT NOT NULL,
+        phone      TEXT DEFAULT '',
+        role       TEXT DEFAULT 'student',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-  // Table utilisateurs
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id         TEXT PRIMARY KEY,
-      fullname   TEXT NOT NULL,
-      email      TEXT UNIQUE NOT NULL,
-      password   TEXT NOT NULL,
-      phone      TEXT DEFAULT '',
-      role       TEXT DEFAULT 'student',
-      created_at TEXT DEFAULT (datetime('now')),
-      updated_at TEXT DEFAULT (datetime('now'))
-    )
-  `);
+    // Table formations
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS courses (
+        id          TEXT PRIMARY KEY,
+        title       TEXT NOT NULL,
+        category    TEXT NOT NULL,
+        level       TEXT NOT NULL,
+        duration    TEXT NOT NULL,
+        price       INTEGER NOT NULL,
+        description TEXT NOT NULL,
+        content     TEXT NOT NULL,
+        summary     TEXT NOT NULL,
+        icon        TEXT DEFAULT '📚',
+        image_url   TEXT DEFAULT '',
+        pdf_url     TEXT DEFAULT '',
+        access_code TEXT NOT NULL,
+        is_active   INTEGER DEFAULT 1,
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-  // Table formations
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS courses (
-      id          TEXT PRIMARY KEY,
-      title       TEXT NOT NULL,
-      category    TEXT NOT NULL,
-      level       TEXT NOT NULL,
-      duration    TEXT NOT NULL,
-      price       INTEGER NOT NULL,
-      description TEXT NOT NULL,
-      content     TEXT NOT NULL,
-      summary     TEXT NOT NULL,
-      icon        TEXT DEFAULT '📚',
-      image_url   TEXT DEFAULT '',
-      pdf_url     TEXT DEFAULT '',
-      access_code TEXT NOT NULL,
-      is_active   INTEGER DEFAULT 1,
-      created_at  TEXT DEFAULT (datetime('now'))
-    )
-  `);
+    // Table enrollments (accès utilisateur → formation)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS enrollments (
+        id          TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        course_id   TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+        enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, course_id)
+      )
+    `);
 
-  // Table enrollments (accès utilisateur → formation)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS enrollments (
-      id         TEXT PRIMARY KEY,
-      user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      course_id  TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      enrolled_at TEXT DEFAULT (datetime('now')),
-      UNIQUE(user_id, course_id)
-    )
-  `);
+    // Table progression des leçons
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS lesson_progress (
+        id          TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        course_id   TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+        lesson_key  TEXT NOT NULL,
+        completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, course_id, lesson_key)
+      )
+    `);
 
-  // Table progression des leçons
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS lesson_progress (
-      id         TEXT PRIMARY KEY,
-      user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      course_id  TEXT NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-      lesson_key TEXT NOT NULL,
-      completed_at TEXT DEFAULT (datetime('now')),
-      UNIQUE(user_id, course_id, lesson_key)
-    )
-  `);
+    // Table tokens révoqués (pour logout sécurisé)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS revoked_tokens (
+        jti         TEXT PRIMARY KEY,
+        revoked_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
 
-  // Table tokens révoqués (pour logout sécurisé)
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS revoked_tokens (
-      jti        TEXT PRIMARY KEY,
-      revoked_at TEXT DEFAULT (datetime('now'))
-    )
-  `);
+    // Index pour performance
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_enrollments_user ON enrollments(user_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_enrollments_course ON enrollments(course_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_progress_user_course ON lesson_progress(user_id, course_id)`);
 
-  // Index pour performance
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_enrollments_user ON enrollments(user_id);
-    CREATE INDEX IF NOT EXISTS idx_enrollments_course ON enrollments(course_id);
-    CREATE INDEX IF NOT EXISTS idx_progress_user_course ON lesson_progress(user_id, course_id);
-  `);
-
-  console.log('✅ Base de données initialisée');
+    console.log('✅ Base de données PostgreSQL initialisée');
+  } finally {
+    client.release();
+  }
 }
 
 // ─────────────────────────────────────────
@@ -866,35 +860,67 @@ Calendrier éditorial + tableau de bord de suivi.
   }
 ];
 
-function seedCourses() {
-  const db = getDB();
-  const { v4: uuidv4 } = require('uuid');
-
-  const insertCourse = db.prepare(`
-    INSERT OR REPLACE INTO courses
-    (id, title, category, level, duration, price, description, content, summary, icon, image_url, access_code)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  const seedAll = db.transaction(() => {
+async function seedCourses() {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const insertCourse = `
+      INSERT INTO courses
+      (id, title, category, level, duration, price, description, content, summary, icon, image_url, access_code)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      ON CONFLICT (id) DO UPDATE SET
+        title = EXCLUDED.title,
+        category = EXCLUDED.category,
+        level = EXCLUDED.level,
+        duration = EXCLUDED.duration,
+        price = EXCLUDED.price,
+        description = EXCLUDED.description,
+        content = EXCLUDED.content,
+        summary = EXCLUDED.summary,
+        icon = EXCLUDED.icon,
+        image_url = EXCLUDED.image_url,
+        access_code = EXCLUDED.access_code
+    `;
+    
     for (const c of COURSES_SEED) {
-      insertCourse.run(
+      await client.query(insertCourse, [
         c.id, c.title, c.category, c.level, c.duration, c.price,
         c.description, c.content, c.summary, c.icon, c.image_url, c.access_code
-      );
+      ]);
     }
-  });
-
-  seedAll();
-  console.log(`✅ ${COURSES_SEED.length} formations insérées`);
+    
+    await client.query('COMMIT');
+    console.log(`✅ ${COURSES_SEED.length} formations insérées dans PostgreSQL`);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('❌ Erreur seed:', error);
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
-// Exécuter si appelé directement
+// ─────────────────────────────────────────
+// FONCTIONS D'EXPORT
+// ─────────────────────────────────────────
+function getDB() {
+  return pool;
+}
+
+// Exécuter si appelé directement (node database.js)
 if (require.main === module) {
-  initDB();
-  seedCourses();
-  console.log('✅ Base de données initialisée et peuplée');
-  process.exit(0);
+  (async () => {
+    try {
+      await initDB();
+      await seedCourses();
+      console.log('✅ Base de données PostgreSQL initialisée et peuplée');
+      process.exit(0);
+    } catch (error) {
+      console.error('❌ Erreur:', error);
+      process.exit(1);
+    }
+  })();
 }
 
-module.exports = { getDB, initDB, seedCourses };
+module.exports = { pool, getDB, initDB, seedCourses };
