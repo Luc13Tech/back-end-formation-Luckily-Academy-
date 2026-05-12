@@ -1,14 +1,14 @@
 // ═══════════════════════════════════════════════════════════
 // LUCKILY ACADEMY — middleware/auth.js
-// Vérification JWT pour routes protégées
+// Vérification JWT pour routes protégées (PostgreSQL)
 // ═══════════════════════════════════════════════════════════
 'use strict';
 
 const jwt = require('jsonwebtoken');
-const { getDB } = require('../database');
+const { pool } = require('../database');
 
 // ─── Middleware principal — vérifie le token ───
-function authenticateToken(req, res, next) {
+async function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.startsWith('Bearer ')
     ? authHeader.slice(7)
@@ -24,28 +24,40 @@ function authenticateToken(req, res, next) {
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // Vérifier si le token est révoqué (logout)
-    const db = getDB();
-    const revoked = db.prepare('SELECT jti FROM revoked_tokens WHERE jti = ?').get(decoded.jti);
-    if (revoked) {
-      return res.status(401).json({
-        success: false,
-        message: 'Session expirée. Veuillez vous reconnecter.'
-      });
-    }
+    const client = await pool.connect();
+    try {
+      // Vérifier si le token est révoqué (logout)
+      const revokedResult = await client.query(
+        'SELECT jti FROM revoked_tokens WHERE jti = $1',
+        [decoded.jti]
+      );
+      
+      if (revokedResult.rows.length > 0) {
+        return res.status(401).json({
+          success: false,
+          message: 'Session expirée. Veuillez vous reconnecter.'
+        });
+      }
 
-    // Vérifier que l'utilisateur existe encore
-    const user = db.prepare('SELECT id, email, fullname, role FROM users WHERE id = ?').get(decoded.userId);
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: 'Utilisateur introuvable.'
-      });
-    }
+      // Vérifier que l'utilisateur existe encore
+      const userResult = await client.query(
+        'SELECT id, email, fullname, role FROM users WHERE id = $1',
+        [decoded.userId]
+      );
+      
+      if (userResult.rows.length === 0) {
+        return res.status(401).json({
+          success: false,
+          message: 'Utilisateur introuvable.'
+        });
+      }
 
-    req.user = user;
-    req.tokenJti = decoded.jti;
-    next();
+      req.user = userResult.rows[0];
+      req.tokenJti = decoded.jti;
+      next();
+    } finally {
+      client.release();
+    }
   } catch (err) {
     if (err.name === 'TokenExpiredError') {
       return res.status(401).json({
@@ -61,7 +73,7 @@ function authenticateToken(req, res, next) {
 }
 
 // ─── Middleware optionnel — ne bloque pas si pas de token ───
-function optionalAuth(req, res, next) {
+async function optionalAuth(req, res, next) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.startsWith('Bearer ')
     ? authHeader.slice(7)
@@ -74,9 +86,16 @@ function optionalAuth(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const db = getDB();
-    const user = db.prepare('SELECT id, email, fullname, role FROM users WHERE id = ?').get(decoded.userId);
-    req.user = user || null;
+    const client = await pool.connect();
+    try {
+      const userResult = await client.query(
+        'SELECT id, email, fullname, role FROM users WHERE id = $1',
+        [decoded.userId]
+      );
+      req.user = userResult.rows.length > 0 ? userResult.rows[0] : null;
+    } finally {
+      client.release();
+    }
   } catch {
     req.user = null;
   }
