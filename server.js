@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
 // LUCKILY ACADEMY — server.js
-// Serveur principal Express + SQLite
+// Serveur principal Express + PostgreSQL
 // Prêt pour déploiement sur Render
 // ═══════════════════════════════════════════════════════════
 'use strict';
@@ -9,7 +9,7 @@
 require('dotenv').config();
 
 // Vérification des variables obligatoires
-const REQUIRED_ENV = ['JWT_SECRET', 'CLAUDE_API_KEY'];
+const REQUIRED_ENV = ['JWT_SECRET', 'CLAUDE_API_KEY', 'DATABASE_URL'];
 for (const envVar of REQUIRED_ENV) {
   if (!process.env[envVar]) {
     console.error(`❌ Variable d'environnement manquante : ${envVar}`);
@@ -21,9 +21,8 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const path = require('path');
 
-const { initDB, seedCourses, getDB } = require('./database');
+const { initDB, seedCourses, pool, getDB } = require('./database');
 const authRoutes = require('./routes/auth');
 const coursesRoutes = require('./routes/courses');
 const claudeRoutes = require('./routes/claude');
@@ -32,23 +31,37 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ──────────────────────────────────────
-// INITIALISATION BASE DE DONNÉES
+// INITIALISATION BASE DE DONNÉES (ASYNC)
 // ──────────────────────────────────────
-try {
-  initDB();
+let dbInitialized = false;
 
-  // Vérifier si les formations existent, sinon les seeder
-  const db = getDB();
-  const coursesCount = db.prepare('SELECT COUNT(*) as count FROM courses').get();
-  if (coursesCount.count === 0) {
-    console.log('📦 Aucune formation trouvée, insertion des données...');
-    seedCourses();
-  } else {
-    console.log(`✅ ${coursesCount.count} formation(s) en base de données`);
+async function initializeDatabase() {
+  try {
+    console.log('📦 Initialisation de la base de données PostgreSQL...');
+    await initDB();
+    
+    // Vérifier si les formations existent, sinon les seeder
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT COUNT(*) as count FROM courses');
+      const coursesCount = parseInt(result.rows[0].count);
+      
+      if (coursesCount === 0) {
+        console.log('📦 Aucune formation trouvée, insertion des données...');
+        await seedCourses();
+      } else {
+        console.log(`✅ ${coursesCount} formation(s) en base de données`);
+      }
+    } finally {
+      client.release();
+    }
+    
+    dbInitialized = true;
+    console.log('✅ Base de données PostgreSQL prête');
+  } catch (err) {
+    console.error('❌ Erreur initialisation DB:', err);
+    throw err;
   }
-} catch (err) {
-  console.error('❌ Erreur initialisation DB:', err);
-  process.exit(1);
 }
 
 // ──────────────────────────────────────
@@ -132,6 +145,23 @@ app.use((req, res, next) => {
 });
 
 // ──────────────────────────────────────
+// MIDDLEWARE POUR ATTENDRE LA DB
+// ──────────────────────────────────────
+app.use(async (req, res, next) => {
+  if (!dbInitialized) {
+    try {
+      await initializeDatabase();
+    } catch (err) {
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Erreur de connexion à la base de données' 
+      });
+    }
+  }
+  next();
+});
+
+// ──────────────────────────────────────
 // ROUTES API
 // ──────────────────────────────────────
 app.use('/api/auth', authLimiter, authRoutes);
@@ -141,16 +171,19 @@ app.use('/api/claude', claudeLimiter, claudeRoutes);
 // ──────────────────────────────────────
 // ROUTE DE SANTÉ (Health Check Render)
 // ──────────────────────────────────────
-app.get('/health', (req, res) => {
-  const db = getDB();
+app.get('/health', async (req, res) => {
   let dbOk = false;
   try {
-    db.prepare('SELECT 1').get();
+    const client = await pool.connect();
+    await client.query('SELECT 1');
+    client.release();
     dbOk = true;
-  } catch { /* ignore */ }
+  } catch (err) {
+    console.error('Health check DB error:', err.message);
+  }
 
   res.json({
-    status: 'ok',
+    status: dbInitialized ? 'ok' : 'initializing',
     service: 'Luckily Academy API',
     version: '1.0.0',
     timestamp: new Date().toISOString(),
@@ -228,6 +261,7 @@ app.use((err, req, res, next) => {
 // ──────────────────────────────────────
 // DÉMARRAGE DU SERVEUR
 // ──────────────────────────────────────
+// On démarre le serveur immédiatement, la DB sera initialisée à la première requête
 app.listen(PORT, '0.0.0.0', () => {
   console.log('\n' + '═'.repeat(50));
   console.log('  🎓  LUCKILY ACADEMY — Backend API');
@@ -237,16 +271,20 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`  🔗  URL locale : http://localhost:${PORT}`);
   console.log(`  📋  Health check : http://localhost:${PORT}/health`);
   console.log('═'.repeat(50) + '\n');
+  console.log('⏳ Initialisation de la base de données PostgreSQL en cours...');
+  console.log('   La première requête peut prendre quelques secondes.\n');
 });
 
 // Gestion propre de l'arrêt
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('🛑 Arrêt du serveur...');
+  await pool.end();
   process.exit(0);
 });
 
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   console.log('🛑 Arrêt du serveur...');
+  await pool.end();
   process.exit(0);
 });
 
