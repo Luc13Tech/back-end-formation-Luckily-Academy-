@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════
 // LUCKILY ACADEMY — database.js
 // Initialisation PostgreSQL + seed des formations
+// Version sans auto-exit pour Render
 // ═══════════════════════════════════════════════════════════
 'use strict';
 
@@ -908,19 +909,8 @@ function getDB() {
   return pool;
 }
 
-// Exécuter si appelé directement (node database.js)
-if (require.main === module) {
-  (async () => {
-    try {
-      await initDB();
-      await seedCourses();
-      console.log('✅ Base de données PostgreSQL initialisée et peuplée');
-      process.exit(0);
-    } catch (error) {
-      console.error('❌ Erreur:', error);
-      process.exit(1);
-    }
-  })();
-}
+// ⚠️ PAS D'AUTO-EXÉCUTION ICI ! ⚠️
+// L'initialisation est gérée par server.js au démarrage
+// Ce fichier n'exporte que les fonctions et le pool
 
 module.exports = { pool, getDB, initDB, seedCourses };
