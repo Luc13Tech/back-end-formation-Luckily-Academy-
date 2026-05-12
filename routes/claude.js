@@ -1,13 +1,13 @@
 // ═══════════════════════════════════════════════════════════
 // LUCKILY ACADEMY — routes/claude.js
-// Route IA Claude avec contexte cours
+// Route IA Claude avec contexte cours (PostgreSQL)
 // ═══════════════════════════════════════════════════════════
 'use strict';
 
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const { getDB } = require('../database');
+const { pool } = require('../database');
 const { authenticateToken, optionalAuth } = require('../middleware/auth');
 
 // Helper fetch avec retry
@@ -51,9 +51,9 @@ router.post('/', optionalAuth, [
     return res.status(400).json({ success: false, message: errors.array()[0].msg });
   }
 
+  const client = await pool.connect();
   try {
     const { message, courseId, lessonId, history = [], lang = 'fr' } = req.body;
-    const db = getDB();
 
     // ── Construction du contexte ──
     let courseContext = '';
@@ -61,20 +61,30 @@ router.post('/', optionalAuth, [
 
     if (courseId) {
       // Récupérer la formation
-      const course = db.prepare('SELECT title, description, category, level FROM courses WHERE id = ?').get(courseId);
-      if (course) {
+      const courseResult = await client.query(
+        'SELECT title, description, category, level FROM courses WHERE id = $1',
+        [courseId]
+      );
+      
+      if (courseResult.rows.length > 0) {
+        const course = courseResult.rows[0];
         courseContext = `Formation concernée : "${course.title}" (${course.category}, ${course.level})\nDescription : ${course.description}\n`;
 
         // Si une leçon est spécifiée et que l'utilisateur est inscrit
         if (lessonId && req.user) {
-          const enrolled = db.prepare(
-            'SELECT id FROM enrollments WHERE user_id = ? AND course_id = ?'
-          ).get(req.user.id, courseId);
+          const enrolledResult = await client.query(
+            'SELECT id FROM enrollments WHERE user_id = $1 AND course_id = $2',
+            [req.user.id, courseId]
+          );
 
-          if (enrolled) {
-            const courseData = db.prepare('SELECT content FROM courses WHERE id = ?').get(courseId);
-            if (courseData && courseData.content) {
-              const content = JSON.parse(courseData.content);
+          if (enrolledResult.rows.length > 0) {
+            const courseDataResult = await client.query(
+              'SELECT content FROM courses WHERE id = $1',
+              [courseId]
+            );
+            
+            if (courseDataResult.rows.length > 0 && courseDataResult.rows[0].content) {
+              const content = JSON.parse(courseDataResult.rows[0].content);
               if (content.chapters) {
                 for (const ch of content.chapters) {
                   if (ch.lessons) {
@@ -94,7 +104,7 @@ router.post('/', optionalAuth, [
       }
     }
 
-    // ── Prompt système ──
+    // ── Prompt syst-ème ──
     const langLabel = { fr: 'Français', en: 'English', es: 'Español', pt: 'Português' }[lang] || 'Français';
 
     const systemPrompt = `Tu es Luckily IA, l'assistant officiel de Luckily Academy — plateforme de formation en ligne fondée par Luc DEGUENON, Spécialiste en Technologie Moderne, basée à Cotonou, Bénin.
@@ -208,6 +218,8 @@ RÈGLES :
       success: false,
       message: 'Erreur lors de la communication avec l\'IA. Veuillez réessayer.'
     });
+  } finally {
+    client.release();
   }
 });
 
@@ -225,24 +237,34 @@ router.post('/lesson-help', authenticateToken, [
     return res.status(400).json({ success: false, message: errors.array()[0].msg });
   }
 
+  const client = await pool.connect();
   try {
     const { courseId, lessonId, type } = req.body;
-    const db = getDB();
 
     // Vérifier enrollment
-    const enrolled = db.prepare(
-      'SELECT id FROM enrollments WHERE user_id = ? AND course_id = ?'
-    ).get(req.user.id, courseId);
-    if (!enrolled) {
+    const enrolledResult = await client.query(
+      'SELECT id FROM enrollments WHERE user_id = $1 AND course_id = $2',
+      [req.user.id, courseId]
+    );
+    
+    if (enrolledResult.rows.length === 0) {
       return res.status(403).json({ success: false, message: 'Non inscrit à cette formation.' });
     }
 
     // Récupérer le contenu de la leçon
-    const courseData = db.prepare('SELECT title, content FROM courses WHERE id = ?').get(courseId);
-    if (!courseData) return res.status(404).json({ success: false, message: 'Formation introuvable.' });
+    const courseResult = await client.query(
+      'SELECT title, content FROM courses WHERE id = $1',
+      [courseId]
+    );
+    
+    if (courseResult.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Formation introuvable.' });
+    }
 
+    const courseData = courseResult.rows[0];
     let lesson = null;
     const content = JSON.parse(courseData.content || '{}');
+    
     if (content.chapters) {
       for (const ch of content.chapters) {
         if (ch.lessons) {
@@ -252,7 +274,9 @@ router.post('/lesson-help', authenticateToken, [
       }
     }
 
-    if (!lesson) return res.status(404).json({ success: false, message: 'Leçon introuvable.' });
+    if (!lesson) {
+      return res.status(404).json({ success: false, message: 'Leçon introuvable.' });
+    }
 
     const prompts = {
       explain: `Explique en détail le concept principal de cette leçon intitulée "${lesson.title}" avec des exemples concrets adaptés au contexte africain. Voici le contenu :\n\n${lesson.content?.substring(0, 1500)}`,
@@ -280,12 +304,16 @@ router.post('/lesson-help', authenticateToken, [
     const data = await apiRes.json();
     const reply = data.content?.[0]?.text;
 
-    if (!reply) return res.status(500).json({ success: false, message: 'Réponse vide.' });
+    if (!reply) {
+      return res.status(500).json({ success: false, message: 'Réponse vide.' });
+    }
 
     res.json({ success: true, reply, type });
   } catch (err) {
     console.error('Lesson help error:', err);
     res.status(500).json({ success: false, message: 'Erreur serveur.' });
+  } finally {
+    client.release();
   }
 });
 
