@@ -66,6 +66,7 @@ async function startServer() {
   // ──────────────────────────────────────
   // CORS — Autorise le frontend Vercel
   // ──────────────────────────────────────
+  // CORS — accepter toutes les origines Vercel + origine configurée
   const corsOrigins = process.env.CORS_ORIGIN
     ? process.env.CORS_ORIGIN.split(',').map(o => o.trim())
     : ['*'];
@@ -74,7 +75,13 @@ async function startServer() {
     origin: function (origin, callback) {
       // Autoriser les requêtes sans origine (Postman, mobile natif)
       if (!origin) return callback(null, true);
+      // Accepter si CORS_ORIGIN = * ou si l'origine correspond
       if (corsOrigins.includes('*') || corsOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      // Accepter automatiquement toutes les URLs Vercel .app du projet
+      if (origin && (origin.endsWith('.vercel.app') || origin.includes('localhost'))) {
+        console.log(`✅ Vercel/localhost autorisé: ${origin}`);
         return callback(null, true);
       }
       console.warn(`⚠️  CORS bloqué pour: ${origin}`);
